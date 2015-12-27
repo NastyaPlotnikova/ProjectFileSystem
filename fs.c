@@ -1,377 +1,585 @@
-#include <stdio.h>
 #include <stdlib.h>
-#include <sys/types.h>
-#include "inode.h"
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include "fs.h"
 
-#define MAX_INODES_COUNT 5;
-#define FREE_INODES_COUNT 4;
-#define MAX_BLOCKS_COUNT 10;
-#define FREE_BLOCKS_COUNT 10;
-#define BLOCK_SIZE 16;
+const int sizeBlock = SIZE_BLOCK;
+int fs_fd = -1;
+const int numRootBlock = NUMROOTBLOCK;
 
-char *fsfilename;
-long max_inodes_count;
-long free_inodes_count;
-long max_blocks_count;
-long free_blocks_count;
-long block_size;
-long param_count=5;
 
-/*чтение свободных индексных дескрипторов*/
-long ReadFreeInodesCount() 
+//загружаем данные из файла и инициализация глоб переменных
+/*если файл не создан,то создаем файл с фс*/
+int load()
 {
-	FILE *file;
-	long result;
-	//открываем двоичный файл для чтения
-	if((file=fopen(fsfilename,"rb"))==0)//NULL
+	int res=0;
+	/*попытка открыть существующий файл с фс, одновременно для чтения
+	* и записи
+	*/
+	fs_fd=open(FILESYSTEM, O_RDWR, 0666);
+	if(fs_fd<0)
 	{
-		printf("sorry,can't open input file.\n");
-		exit(-1);
+		//если не создан, создаем новый файл с фс
+		fs_fd=open(FILESYSTEM, O_CREAT | O_RDWR, 0666);
+		//создаем корень
+		if (fs_fd<0||createRoot()!=0)
+			res=-1;
 	}
-	fseek(file,0,SEEK_SET);//устанавливаем указатель текущей позиции файла
-	//с начала файла.
-	fread(&result, sizeof(result),1,file);//считываем 1 объект размером sizeof(result) из file
-	//в result, return кол-во считанных объектов
-	fclose(file);
+	return res;//0-успешное завершение
+}
+ 
+//создаем корень
+int createRoot()
+{
+	int res=-1;
+	inode_t *root=(inode_t *)createBlock();
+	if (root!=NULL)
+	{
+		//корневая директория
+		root->status = BLOCK_IS_dir;
+		root->name[0] = '\0';
+		root->stat.st_mode = S_IFDIR | 0777;
+		root->stat.st_nlink = 2;
+		if (writeBlock(numRootBlock, root) == 0)
+		{
+			res = 0;
+		}
+		freeMemoryBlock(root);
+	}
+	return res;
+}
+
+void *createBlock()
+{
+	//возвращает указатель на первый байт выделенной области
+	return calloc(sizeBlock, sizeof(char));
+}
+
+void freeMemoryBlock(void *block)
+{
+    free(block);//освобождаем память
+}
+
+int readBlock(int num, void *block)
+{
+	int res=-1;
+	//смещение от начала файла в байтах
+	if (num>=0&&lseek(fs_fd, sizeBlock * num, SEEK_SET) >= 0)
+	{
+		//cчитываем
+		if (read(fs_fd,block,sizeBlock)>=0)
+		{
+			res=0;
+		}
+	}
+	return res;
+}
+
+int writeBlock(int num,void *block)
+{
+	int res = -1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num, SEEK_SET) >= 0)
+	{
+		if (write(fs_fd, block, sizeBlock) == sizeBlock)
+		{
+			res = 0;
+		}
+	}
+	return res;
+}
+
+//ищем первый свободный блок
+int searchFreeBlock()
+{
+	int num=numRootBlock+1; //номер следования
+	char status;
+	int read_res;
+	while(TRUE)
+	{
+		//выход за границы файла
+		if (lseek(fs_fd,  sizeBlock * num, SEEK_SET) < 0)
+		{
+			num = -1;
+			break;
+		}
+		read_res=read(fs_fd,&status,sizeof(char));
+		if (read_res < 0)
+		{
+			num = -1;
+			break;
+		}
+		//конец файла или нашли свободный блок
+		if (read_res == 0 || status == BLOCK_IS_FREE)
+		{
+			break;
+		}
+		//нашли номер этого блока
+		num++;
+	}
+	return num;
+}
+
+//получаем блок по его номеру
+void *getBlock(int num)
+{
+	void *block = NULL;
+	if (num >= 0)
+	{
+		//инициализируем блок
+		block=createBlock();
+		if(block!=NULL&&readBlock(num,block)!=0)
+		{
+			freeMemoryBlock(block);
+			block=NULL;
+		}
+	}
+	return block;
+}
+
+//заносим инфу о статусе
+int setBlockStatus(int num, char status)
+{
+	int res=-1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num + BLOCK_STATUS_OFFSET, SEEK_SET) >= 0)
+	{
+		//если запись без ошибок
+		if (write(fs_fd, &status, sizeof(char)) == sizeof(char))
+			res=0;
+	}
+	return res;
+}
+
+//удалить блок 
+int removeBlock(int num)
+{
+	int res=0;
+	int status=getBlockStatus(num);
+	//действия в зависимости от того,чем является блок
+	switch(status) 
+	{
+		case BLOCK_IS_FREE:
+			break;
+		case BLOCK_IS_dir:
+			removeDir(num);//удалить папку 
+			break;
+		case BLOCK_IS_FILE:
+			removeFile(num);
+			break;
+		default:
+			res= -1;
+			break;
+	}
+	return res;
+}
+
+//поиск узла
+//если найден,возвращает его номер
+int searchInode(int node_num,char **nodeNames)
+{
+	int res=-1;
+	//узел существует
+	if (node_num >= 0 && nodeNames != NULL)
+	{
+		if (*nodeNames == NULL)//имя узла не задано
+		{
+			res= node_num;
+		}
+		else 
+		{
+			//ищем след свободный узел
+			int next_node_num = searchInodeInDir(node_num, *nodeNames);
+			if (next_node_num > 0)
+			{
+				res = searchInode(next_node_num, nodeNames + 1);
+			}
+		}
+	}
+	return res;
+}
+
+//удаление файла
+//то есть помечаем блок,где хранился файл как свободный
+int removeFile(int num)
+{
+    return setBlockStatus(num, BLOCK_IS_FREE);
+}
+
+//удаление директории
+int removeDir(int num)
+{
+	int res=-1;
+	inode_t *dir = (inode_t *)getBlock(num);
+	if (dir != NULL)//если папка не пуста
+	{
+		/*определяем начало и конец*/
+		int *start = (int *)dir->content;
+		int *end = (int *)((void *)dir + sizeBlock);
+		//проход по папке 
+		while (start < end)
+		{
+			if (*start > 0)
+			{
+				removeBlock(*start);
+			}
+			start++;
+		}
+		freeMemoryBlock(dir);//освобожиди память
+		res = setBlockStatus(num, BLOCK_IS_FREE);
+	}
+	return res;
+}
+
+int createDir(const char *name, mode_t mode)
+{
+	//ищем номер свободного блока
+	int num = searchFreeBlock();
+	if (num >= 0)
+	{
+		//выделяем память
+		inode_t *dir = (inode_t *)createBlock();
+		if (dir != NULL)
+		{
+			int name_size = strlen(name) + 1;
+			if (name_size > NODE_NAME_MAX_SIZE)
+			{
+				name_size = NODE_NAME_MAX_SIZE;
+			}
+			//флаг,что блок является папкой
+			dir->status = BLOCK_IS_dir;
+			memcpy(dir->name, name, name_size);
+			dir->stat.st_mode = S_IFDIR | mode;
+			dir->stat.st_nlink = 2;
+			if (writeBlock(num, dir) != 0)
+			{
+				num = -1;
+			}
+			freeMemoryBlock(dir);//освобождаем память
+			
+		}
+	}
+	return num;
+}
+
+int createFile(const char *name, mode_t mode, dev_t dev)
+{
+	int num = searchFreeBlock();
+	if (num >= 0)
+	{
+		inode_t *file = (inode_t *)createBlock();
+		if (file != NULL)
+		{
+			int name_size = strlen(name) + 1;
+			if (name_size > NODE_NAME_MAX_SIZE)
+			{
+				name_size = NODE_NAME_MAX_SIZE;
+			}
+			file->status = BLOCK_IS_FILE;
+			memcpy(file->name, name, name_size);
+			file->stat.st_mode = S_IFREG | mode;
+			file->stat.st_rdev = dev;
+			file->stat.st_nlink = 1;
+			if (writeBlock(num, file) != 0)
+			{
+				num = -1;
+			}
+		freeMemoryBlock(file);
+        }
+    }
+    return num;
+}
+
+//парсер адреса
+char **parserPath(const char *path)
+{
+	char **res = NULL;
+	int path_size = strlen(path) + 1;
+	char *copy_path = (char *)malloc(path_size);
+	if (copy_path != NULL)
+	{
+		memcpy(copy_path, path, path_size);
+		int depth = 0;//вложенность
+		int i = 0;
+		//пока не дошли до корневого
+		while (copy_path[i] != '\0')
+		{
+			if (copy_path[i] == '/')
+			{
+				depth++;
+				copy_path[i] = '\0';
+			}
+			i++;
+			
+		}
+		if (copy_path[i - 1] == '\0')
+		{
+			depth--;
+		}
+		res = (char **)malloc(sizeof(char **) * (depth + 1));
+		if (res != NULL)
+		{
+			i = 0;
+			int j = 0;
+			while (j < depth)
+			{
+				while (copy_path[i++] != '\0');
+				res[j++] = createName(copy_path + i);
+			}
+			res[j] = NULL;
+		}
+		free(copy_path);
+	}
+	return res;
+}
+
+int getBlockStatus(int num)
+{
+	int res=-1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num + BLOCK_STATUS_OFFSET, SEEK_SET) >= 0)
+	{
+		char status;
+		res= read(fs_fd, &status, sizeof(char));
+		 if (res < 0)
+		{
+			res = -1;
+		}
+		else if (res == 0)//считано 0байт
+		{
+			res = BLOCK_IS_FREE;
+		}
+		else
+		{
+			res = status;//присваиваем полученное при считывании значение
+			
+		}
+	}
+	return res;
+}
+
+int getInodeName(int num, char *buf)
+{
+	int res = -1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num + NODE_NAME_OFFSET, SEEK_SET) >= 0)
+	{
+		//считываем в переменную и проверяем на ошибки
+		if (read(fs_fd, buf, NODE_NAME_MAX_SIZE) == NODE_NAME_MAX_SIZE)
+		{
+			res = 0;
+		}
+	}
+	return res;
+}
+
+int getInodeStat(int num, stat_file_t *stbuf)
+{
+	int res = -1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num + NODE_STAT_OFFSET, SEEK_SET) >= 0)
+	{
+		if (read(fs_fd, stbuf, sizeof(stat_file_t)) == sizeof(stat_file_t))
+		{
+			res = 0;
+		}
+	}
+	return res;
+}
+
+//*buf-указатель на заданное имя
+int setInodeName(int num, char *buf)
+{
+	int res= -1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num + NODE_NAME_OFFSET, SEEK_SET) >= 0)
+	{
+		if (write(fs_fd, buf, NODE_NAME_MAX_SIZE) == NODE_NAME_MAX_SIZE)
+		{
+			res = 0;
+		}
+	}
+	return res;
+}
+
+int setInodeStat(int num, stat_file_t *buf)
+{
+	int res = -1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num + NODE_STAT_OFFSET, SEEK_SET) >= 0)
+	{
+		if (write(fs_fd, buf, sizeof(stat_file_t)) == sizeof(stat_file_t))
+		{
+			res = 0;
+		}
+	}
+	return res;
+}
+
+char *createName(const char *name)
+{
+	char *res = (char *)calloc(NODE_NAME_MAX_SIZE, sizeof(char));
+	if (res != NULL)
+	{
+		int size = strlen(name) + 1;
+		if (size > NODE_NAME_MAX_SIZE)
+		{
+			size = NODE_NAME_MAX_SIZE;
+		}
+		memcpy(res, name, size);
+	}
+	return res;
+	
+}
+
+char *createEmptyName()
+{
+	return (char *)calloc(NODE_NAME_MAX_SIZE, sizeof(char));
+}
+
+void freeMemoryName(char *name)
+{
+    free(name);
+}
+
+// исключить имя последнего узла
+char *excludeLastNodeName(char **nodeNames)
+{
+	char *result = NULL;
+	if (nodeNames != NULL && *nodeNames != NULL)
+	{
+		 while (nodeNames[1] != NULL)
+		{
+			nodeNames++;
+		}
+		result = nodeNames[0];
+		nodeNames[0] = NULL;
+	}
 	return result;
 }
 
-void WriteFreeInodesCount(long value)
+void freeMemoryNodeNames(char **nodeNames)
 {
-	FILE *file;
-	//открытие на чтение/запись
-	if((file=fopen(fsfilename,"r+b"))==0)//NULL
+	if (nodeNames != NULL)
 	{
-		printf("sorry,can't open input file.\n");
-		exit(-1);
-	}
-	
-	fseek(file,0, SEEK_SET);
-	fwrite(&value,sizeof(value),1,file);
-	fclose(file);
+		char **tmp = nodeNames;
+		while (*tmp != NULL)
+		{
+			freeMemoryName(*tmp);
+			tmp++;
+		}
+		free(nodeNames);
+	}	
 }
 
-long ReadMaxInodesCount()
+int clearBlock(int num)
 {
-	FILE *file;
-    long result;
-    if((file=fopen(fsfilename,"rb"))==0)
-    {
-        printf("Sorry, Can't open input file.\n");
-        exit(-1);
-    }
-
-    fseek(file, sizeof(long), SEEK_SET);
-    fread(&result, sizeof(result), 1, file);
-    fclose(file);
-    return result;
-}
-
-void WriteMaxInodesCount(long value)
-{
-    FILE *file;
-    if((file=fopen(fsfilename,"r+b"))==0)
-    {
-        printf("Sorry, Can't open input file.\n");
-        exit(-1);
-    }
-
-    fseek(file, sizeof(long), SEEK_SET);
-    fwrite(&value, sizeof(value), 1, file);
-    fclose(file);
-}
-
-long ReadFreeBlocksCount()
-{
-    FILE *file;
-    long result;
-    if((file=fopen(fsfilename,"rb"))==0)
-    {
-        printf("Sorry, Can't open input file.\n");
-        exit(-1);
-    }
-
-    //указатель с начала файла, смещение на 2*sizeof(long)
-    fseek(file, 2*sizeof(long), SEEK_SET);
-    fread(&result, sizeof(result), 1, file);
-    fclose(file);
-    return result;
-}
-
-void WriteFreeBlocksCount(long value)
-{
-    FILE *file;
-    if((file=fopen(fsfilename,"r+b"))==0)
-    {
-        printf("Sorry, Can't open input file.\n");
-        exit(-1);
-    }
-
-    fseek(file, 2*sizeof(long), SEEK_SET);
-    fwrite(&value, sizeof(value), 1, file);
-    fclose(file);
-}
-
-long ReadMaxBlocksCount()
-{
-    FILE *file;
-    long result;
-    if((file=fopen(fsfilename,"rb"))==0)
-    {
-        printf("Can't open input file.\n");
-        exit(-1);
-    }
-
-    fseek(file, 3*sizeof(long), SEEK_SET);
-    fread(&result, sizeof(result), 1, file);
-    fclose(file);
-    return result;
-}
-
-void WriteMaxBlocksCount(long value)
-{
-    FILE *file;
-    if((file=fopen(fsfilename,"r+b"))==0)
-    {
-        printf("Can't open input file.\n");
-        exit(-1);
-    }
-
-    fseek(file, 3*sizeof(long), SEEK_SET);
-    fwrite(&value, sizeof(value), 1, file);
-    fclose(file);
-}
-
-long ReadBlockSize()
-{
-    FILE *file;
-    long result;
-    if((file=fopen(fsfilename,"rb"))==0)
-    {
-        printf("Can't open input file.\n");
-        exit(-1);
-    }
-
-    fseek(file, 4*sizeof(long), SEEK_SET);
-    fread(&result, sizeof(result), 1, file);
-    fclose(file);
-    return result;
-}
-
-void WriteBlockSize(long value)
-{
-    FILE *file;
-    if((file=fopen(fsfilename,"r+b"))==0)
-    {
-        printf("Can't open input file.\n");
-        exit(-1);
-    }
-
-    fseek(file, 4*sizeof(long), SEEK_SET);
-    fwrite(&value, sizeof(value), 1, file);
-    fclose(file);
-}
-
-void Load()
-{
-	FILE *file;
-	
-	if((file=fopen(fsfilename,"rb"))==0)
+	int res = -1;
+	if (num >= 0 && lseek(fs_fd, sizeBlock * num, SEEK_SET) >= 0)
 	{
-		printf("Sorry,Can't open input file. \n");
-		exit(-1);
+		void *block = createBlock();
+		if (block != NULL)
+		{
+			if (writeBlock(num, block) == 0)
+			{
+				res = 0;
+			}
+			freeMemoryBlock(block);
+		}
 	}
-	//считываем 1 объект размером sizeof() из file
-	//в переменную, return кол-во считанных объектов
-	fread(&free_inodes_count,sizeof(free_inodes_count),1,file);
-	fread(&free_inodes_count, sizeof(free_inodes_count), 1, file);
-        fread(&max_inodes_count, sizeof(max_inodes_count), 1, file);
-	fread(&free_blocks_count, sizeof(free_blocks_count), 1, file);
-        fread(&max_blocks_count, sizeof(max_blocks_count), 1, file);
-	fread(&block_size, sizeof(block_size), 1, file);
-	fclose(file);
+	return res;
 }
 
-void Create()
+int addInodeToDir(int dir_num, int node_num)
 {
-	FILE *file;
-	long i;
-	if((file=fopen(fsfilename,"wb"))==0)
+	int res = -1;
+	if (dir_num >= 0 && node_num > 0)
 	{
-		printf("Sorry,Can't open input file. \n");
-		exit(-1);
+		inode_t *dir = (inode_t *)getBlock(dir_num);
+		if (dir != NULL)
+		{
+			if (dir->status == BLOCK_IS_dir)
+			{
+				int *start = (int *)dir->content;
+				int *end = (int *)((void *)dir + sizeBlock);
+				//проход по папке
+				while (start < end)
+				{
+					if (*start <= 0)
+					{
+						*start = node_num;
+						break;
+					}
+					start++;
+				}
+				if (start < end)
+				{
+					res= writeBlock(dir_num, dir);
+				}
+			}
+			freeMemoryBlock(dir);
+			
+		}
 	}
-	
-	long max_inodes_count = MAX_INODES_COUNT;
-        long free_inodes_count = FREE_INODES_COUNT;
-	long max_blocks_count = MAX_BLOCKS_COUNT;
-	long free_blocks_count = FREE_BLOCKS_COUNT;
-	long block_size = BLOCK_SIZE;
-	
-	fwrite(&free_inodes_count, sizeof(free_inodes_count), 1, file);
-	fwrite(&max_inodes_count, sizeof(max_inodes_count), 1, file);
-        fwrite(&free_blocks_count, sizeof(free_blocks_count), 1, file);
-	fwrite(&max_blocks_count, sizeof(max_blocks_count), 1, file);
-	fwrite(&block_size, sizeof(block_size), 1, file);
-	
-	for(i=max_inodes_count-1; i>=0; i--)
-	{
-		struct inode_t n;
-		n.i_gen=i;
-		fwrite(&n, sizeof(n),1,file);
-	}
-	
-	for (i=max_inodes_count-1; i>=0; i--)
-	{
-		long n=i;
-		fwrite(&n, sizeof(n),1,file);
-	}
-	
-	for(i=max_blocks_count-1; i>=0; i--)
-	{
-		long n=i;
-		fwrite(&n, sizeof(n), 1, file);
-	}
-	fclose(file);
+	return res;
 }
 
-void PrintAll()
+int removeNodeFromDir(int dir_num, int node_num)
 {
-	printf("Print all:\n");
-	printf("free_inodes_count = %ld\n", free_inodes_count);
-	printf("max_inodes_count = %ld\n", max_inodes_count);
-	printf("free_blocks_count = %ld\n", free_blocks_count);
-	printf("max_blocks_count = %ld\n", max_blocks_count);
-	printf("block_size = %ld\n", block_size);
-	printf("\n\n");
+	int res= -1;
+	if (dir_num >= 0 && node_num > 0)
+	{
+		inode_t *dir = (inode_t *)getBlock(dir_num);
+		if (dir != NULL)
+		{
+			if (dir->status == BLOCK_IS_dir)
+			{
+				int *start = (int *)dir->content;
+				int *end = (int *)((void *)dir + sizeBlock);
+				while (start < end)
+				{
+					if (*start == node_num)
+					{
+						*start = 0;
+						break;
+					}
+					start++;
+				}
+			if (start < end)
+			{
+				res = writeBlock(dir_num, dir);
+			}
+			else
+			{
+				res = 0;
+			}
+            }
+            freeMemoryBlock(dir);
+        }
+    }
+    return res;
 }
 
-long GetNewInodeIndex()
+int searchInodeInDir(int dir_num, const char *node_name)
 {
-	long count=ReadFreeInodesCount(); //считываем кол-во свободных
-	if (count==0)
-		return -1;
-	FILE *file;
-	long result;
-	if ((file=fopen(fsfilename,"rb"))=0)
+	int result = -1;
+	if (dir_num >= 0 && node_name != NULL)
 	{
-		printf("Sorry,Can't open input file. \n");
-		exit(-1);
+		inode_t *dir = (inode_t *)getBlock(dir_num);
+		if (dir != NULL)
+		{
+			if (dir->status == BLOCK_IS_dir)
+			{
+				char name[NODE_NAME_MAX_SIZE];
+				int *start = (int *)dir->content;
+				int *end = (int *)((void *)dir + sizeBlock);
+				while (start < end)
+				{
+					if (*start > 0 && getInodeName(*start, name) == 0 && strcmp(node_name, name) == 0)
+					{
+						result = *start;
+						break;
+					}
+					start++;
+				}
+			}
+			freeMemoryBlock(dir);
+		}
 	}
-	long offset=param_count*sizeof(long)+max_inodes_count*sizeof(struct inode_t)+(count-1)*sizeof(long);
-	printf("offset=%ld\n", offset);
-	fseek(file,offset,SEEK_SET);
-	fread(&result,sizeof(result),1,file);
-	fclose(file);
-	writeFreeInodesCount(--count);
 	return result;
-}
-
-long FreeInodeIndex(long index)
-{
-	if (index<0 || index>=max_inodes_count)
-		return -1;
-	long count=ReadFreeInodesCount();
-	FILE *file;
-	if ((file=fopen(fsfilename,"r+b"))==0);
-	{
-		printf("Sorry,Can't open input file. \n");
-		exit(-1);
-	}
-	long offset = param_count * sizeof(long) + max_inodes_count * sizeof(struct dinode) + count * sizeof(long);
-		fseek(file, offset, SEEK_SET);
-	fwrite(&index, sizeof(index), 1, file);
-	fclose(file);WriteFreeInodesCount(++count);
-	return index;
-}
-
-long GetNewBlockIndex()
-{
-    long count = ReadFreeBlocksCount();
-
-    if(count == 0)
-        return -1;
-    FILE *file;
-    long result;
-    if((file=fopen(fsfilename,"rb"))==0)
-    {
-        printf("Sorry, Can't open input file.\n");
-        exit(-1);
-    }
-    long offset = param_count * sizeof(long) + max_inodes_count * sizeof(struct dinode) + max_inodes_count * sizeof(long) + (count - 1) * sizeof(long);
-    printf("offset = %ld\n", offset);
-    fseek(file, offset, SEEK_SET);
-    fread(&result, sizeof(result), 1, file);
-    fclose(file);
-    WriteFreeBlocksCount(--count);
-    return result;
-}
-
-long FreeBlockIndex(long index)
-{
-    if(index < 0 || index >= max_blocks_count)
-        return -1;
-    long count = ReadFreeBlocksCount();
-
-    FILE *file;
-    if((file=fopen(fsfilename,"r+b"))==0)
-    {
-        printf("Sorry, Can't open input file.\n");
-        exit(-1);
-    }
-
-    long offset = param_count * sizeof(long) + max_inodes_count * sizeof(struct dinode) + max_inodes_count * sizeof(long) + count * sizeof(long);
-    fseek(file, offset, SEEK_SET);
-    fwrite(&index, sizeof(index), 1, file);
-    fclose(file);
-    WriteFreeBlocksCount(++count);
-    return index;
-}
-
-int main(int argc, char *argv[])
-{
-	fsfilename=argv[1];
-	Create();
-	Load();
-	PrintAll();
-	
-	printf("new inode index = %ld\n", GetNewInodeIndex());
-	printf("new inode index = %ld\n", GetNewInodeIndex());
-	printf("new inode index = %ld\n", GetNewInodeIndex());
-	printf("new inode index = %ld\n", GetNewInodeIndex());
-	printf("new inode index = %ld\n", GetNewInodeIndex());
-	FreeInodeIndex(3);
-	printf("new inode index = %ld\n", GetNewInodeIndex());
-	printf("new inode index = %ld\n", GetNewInodeIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	FreeBlockIndex(5);
-	
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	printf("new block address = %ld\n", GetNewBlockIndex());
-	Load();
-	PrintAll();
 }
